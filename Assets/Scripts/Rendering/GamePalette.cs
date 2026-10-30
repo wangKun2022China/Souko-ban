@@ -30,7 +30,6 @@ namespace SokoBan.Rendering
         public Color goalColor = Hex(0xd0, 0x6a, 0x4a);
         public Color boxColor = Hex(0xc8, 0x92, 0x5a);
         public Color boxOnGoal = Hex(0x2f, 0x9e, 0x6f);
-        public Color boxDead = Hex(0xe5, 0x48, 0x4d);
         public Color triggerColor = Hex(0x4a, 0x9e, 0xae);
         public Color gateColor = Hex(0x55, 0x5f, 0x7a);
         public Color rockColor = Hex(0x8b, 0x95, 0xa0);

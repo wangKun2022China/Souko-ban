@@ -8,8 +8,6 @@ namespace SokoBan.Rendering
     // 绘制场景
     public class Board3DRenderer : MonoBehaviour
     {
-        public bool deadlockHint = true;
-
         [SerializeField] private GamePalette _palette;
         [SerializeField] private GameObject _playerPrefab;
         private GameObject _tipBarPrefab;
@@ -438,15 +436,12 @@ namespace SokoBan.Rendering
         {
             var g = _game;
             if (g == null) return;
-            var dead = deadlockHint ? g.DeadlockedBoxes() : null;
 
-            for (int i = 0; i < g.Boxes.Count; i++)
+            foreach (var b in g.Boxes)
             {
-                var b = g.Boxes[i];
                 if (!_boxMats.TryGetValue(b.Id, out var mat)) continue;
                 if (b.Id == g.HeldBoxId) Primitives.SetEmissive(mat, Palette.heldColor, 0.55f);
                 else if (g.IsGoal(b.R, b.C)) Primitives.SetEmissive(mat, Palette.boxOnGoal, 0.5f);
-                else if (dead != null && dead.Contains(i)) Primitives.SetEmissive(mat, Palette.boxDead, 0.55f);
                 else Primitives.SetEmissive(mat, Color.black, 0f);
             }
         }

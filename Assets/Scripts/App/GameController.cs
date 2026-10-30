@@ -81,8 +81,11 @@ namespace SokoBan.App
         public void StartClassic(int index)
         {
             if (index < 0 || index >= Levels.All.Count) { _ui.Toast("没有该关卡", false); return; }
-            if (index > 0 && !SaveManager.IsCompleted("c" + (index - 1))) { _audio.Error(); _ui.Toast("请先完成上一关", true); return; }
-
+            if (index > 0 && !SaveManager.IsCompleted("c" + (index - 1))) {
+                _audio.Error();
+                _ui.Toast("请先完成上一关", true);
+                return; 
+            }
             var lv = Levels.All[index];
             _custom = false;
             _classicIndex = index;
@@ -98,8 +101,11 @@ namespace SokoBan.App
         public void StartCustom(string id)
         {
             var lv = SaveManager.GetLevel(id);
-            if (lv == null) { _audio.Error(); _ui.Toast("关卡不存在", true); return; }
-
+            if (lv == null) {
+                _audio.Error();
+                _ui.Toast("关卡不存在", true); 
+                return; 
+            }
             _custom = true;
             _classicIndex = -1;
             _customId = id;
@@ -116,8 +122,6 @@ namespace SokoBan.App
             _game = Game.FromAscii(_rows, _links, _tips);
             _won = false;
 
-            var settings = SaveManager.GetSettings();
-            _renderer.deadlockHint = settings.deadlockHint;
             _renderer.SetGame(_game);
 
             string display = _custom ? _name : (_classicIndex + 1) + ". " + _name;

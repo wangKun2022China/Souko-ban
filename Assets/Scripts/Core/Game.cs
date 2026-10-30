@@ -87,7 +87,7 @@ namespace SokoBan.Core
         // 阻挡移动：越界、墙体、空（坑洞），以及未开启的被触发块
         public bool IsWall(int r, int c) => !InBounds(r, c) || walls.Contains((r, c)) || voids.Contains((r, c)) || (gates.Contains((r, c)) && !IsGateOpen(r, c));
 
-        // 仅墙体（不含机关门与坑洞），用于死角判定等不能误报的场景
+        // 仅墙体（不含机关门与坑洞），用于推箱阻挡 / 吸住视线等不能误报的场景
         public bool IsSolidWall(int r, int c) => !InBounds(r, c) || walls.Contains((r, c));
 
         public bool IsGoal(int r, int c) => goals.Contains((r, c));
@@ -300,23 +300,6 @@ namespace SokoBan.Core
             history.Clear();
             redo.Clear();
             Facing = Dir.Down;
-        }
-
-        // 返回陷入简单死角（永不可解）的箱子下标；只做安全判定，不误报
-        public List<int> DeadlockedBoxes()
-        {
-            var res = new List<int>();
-            for (int i = 0; i < boxes.Count; i++)
-            {
-                var b = boxes[i];
-                if (IsGoal(b.R, b.C)) continue;
-                bool up = IsSolidWall(b.R - 1, b.C);
-                bool down = IsSolidWall(b.R + 1, b.C);
-                bool left = IsSolidWall(b.R, b.C - 1);
-                bool right = IsSolidWall(b.R, b.C + 1);
-                if ((up && left) || (up && right) || (down && left) || (down && right)) res.Add(i);
-            }
-            return res;
         }
 
         private State CaptureState()

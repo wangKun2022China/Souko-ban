@@ -5,7 +5,7 @@ using UnityEngine.UI;
 
 namespace SokoBan.UI
 {
-    // <summary>全屏黑场转场：过关时淡入淡出。
+    // 全屏黑场转场：过关时淡入淡出。
     public class ScreenFader
     {
         private readonly MonoBehaviour _host;
