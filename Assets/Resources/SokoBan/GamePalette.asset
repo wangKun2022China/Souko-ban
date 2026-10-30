@@ -1,0 +1,65 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7d27b7b151717b0448c6533dc8054cd2, type: 3}
+  m_Name: GamePalette
+  m_EditorClassIdentifier: 
+  background: {r: 0.84705883, g: 0.9019608, b: 0.8862745, a: 1}
+  warmGround: {r: 0.7882353, g: 0.72156864, b: 0.627451, a: 1}
+  sunColor: {r: 1, g: 0.9490196, b: 0.8666667, a: 1}
+  waterColor: {r: 0.45490196, g: 0.6431373, b: 0.6509804, a: 1}
+  islandColor: {r: 0.8784314, g: 0.8117647, b: 0.6431373, a: 1}
+  wallColors:
+  - {r: 0.79607844, g: 0.7647059, b: 0.7137255, a: 1}
+  - {r: 0.7607843, g: 0.7294118, b: 0.6784314, a: 1}
+  - {r: 0.7254902, g: 0.69411767, b: 0.6431373, a: 1}
+  - {r: 0.6901961, g: 0.65882355, b: 0.60784316, a: 1}
+  - {r: 0.65490198, g: 0.62352943, b: 0.57254905, a: 1}
+  - {r: 0.74509805, g: 0.7137255, b: 0.6627451, a: 1}
+  - {r: 0.7058824, g: 0.6745098, b: 0.62352943, a: 1}
+  floorA: {r: 0.5882353, g: 0.69803923, b: 0.36862746, a: 1}
+  floorB: {r: 0.5411765, g: 0.654902, b: 0.33333334, a: 1}
+  goalColor: {r: 0.8156863, g: 0.41568628, b: 0.2901961, a: 1}
+  boxColor: {r: 0.78431374, g: 0.57254905, b: 0.3529412, a: 1}
+  boxOnGoal: {r: 0.18431373, g: 0.61960787, b: 0.43529412, a: 1}
+  boxDead: {r: 0.8980392, g: 0.28235295, b: 0.3019608, a: 1}
+  triggerColor: {r: 0.2901961, g: 0.61960787, b: 0.68235296, a: 1}
+  gateColor: {r: 0.33333334, g: 0.37254903, b: 0.47843137, a: 1}
+  rockColor: {r: 0.54509807, g: 0.58431375, b: 0.627451, a: 1}
+  heldColor: {r: 0.22745098, g: 0.627451, b: 0.9490196, a: 1}
+  cream: {r: 0.96862745, g: 0.9490196, b: 0.9098039, a: 1}
+  dark: {r: 0.16470589, g: 0.18431373, b: 0.21960784, a: 1}
+  orange: {r: 0.8784314, g: 0.5411765, b: 0.18039216, a: 1}
+  wall2D: {r: 0.42, g: 0.47, b: 0.47, a: 1}
+  empty2D: {r: 0.68, g: 0.8, b: 0.81, a: 1}
+  floor2D: {r: 0.62, g: 0.72, b: 0.42, a: 1}
+  goal2D: {r: 0.816, g: 0.416, b: 0.29, a: 1}
+  box2D: {r: 0.784, g: 0.573, b: 0.353, a: 1}
+  player2D: {r: 0.95, g: 0.9, b: 0.8, a: 1}
+  trigger2D: {r: 0.28, g: 0.62, b: 0.68, a: 1}
+  gate2D: {r: 0.36, g: 0.38, b: 0.5, a: 1}
+  link2D: {r: 0.98, g: 0.72, b: 0.2, a: 1}
+  floorTop: 0.06
+  boxHeight: 0.4
+  wallMinHeight: 0.55
+  wallHeightVariation: 0.22
+  islandPad: 1.6
+  islandDepth: 0.5
+  islandY: -0.25
+  waterSize: 13
+  waterY: -0.42
+  fogStart: 9
+  fogEnd: 90
+  cameraFov: 40
+  cameraNear: 0.1
+  cameraFar: 140
+  sunIntensity: 1.15
+  ambientIntensity: 0.75

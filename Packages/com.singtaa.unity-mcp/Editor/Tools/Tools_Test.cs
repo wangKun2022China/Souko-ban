@@ -1,0 +1,1003 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using UnityEditor;
+using UnityEditor.TestTools.TestRunner.Api;
+using UnityEngine;
+
+namespace UnityMcp {
+    /// <summary>
+    /// MCP tools for running Unity tests (EditMode and PlayMode) and retrieving results.
+    /// </summary>
+    public static class Tools_Test {
+        // Stores test results from the last run
+        static TestRunState _lastRunState;
+        static readonly object _stateLock = new object();
+
+        // Domain reload tracking: tests aren't ready immediately after reload
+        static double _lastDomainReloadTime;
+        const double DomainReloadStabilizationSeconds = 1.0;
+
+        // Test list cache: RetrieveTestList may fire its callback asynchronously
+        // after domain reload, so we pre-warm the cache and use it as a fallback
+        static ITestAdaptor _cachedEditModeRoot;
+        static ITestAdaptor _cachedPlayModeRoot;
+        static TestRunnerApi _cacheApi; // kept alive until async callbacks complete
+        static int _cacheCallbacksRemaining; // tracks how many callbacks we're waiting for
+
+        [InitializeOnLoadMethod]
+        static void OnDomainReload() {
+            _lastDomainReloadTime = EditorApplication.timeSinceStartup;
+            RestoreRunState();
+            ReattachInflightRunCallbacks();
+            _cachedEditModeRoot = null;
+            _cachedPlayModeRoot = null;
+            if (_cacheApi != null) {
+                ScriptableObject.DestroyImmediate(_cacheApi);
+                _cacheApi = null;
+            }
+            EditorApplication.delayCall += PreWarmTestListCache;
+        }
+
+        static void PreWarmTestListCache() {
+            if (EditorApplication.isCompiling) {
+                EditorApplication.delayCall += PreWarmTestListCache;
+                return;
+            }
+
+            if (_cacheApi != null) {
+                ScriptableObject.DestroyImmediate(_cacheApi);
+            }
+            _cacheApi = ScriptableObject.CreateInstance<TestRunnerApi>();
+            _cacheCallbacksRemaining = 2;
+
+            _cacheApi.RetrieveTestList(TestMode.EditMode, (root) => {
+                _cachedEditModeRoot = root;
+                CleanupCacheApiIfDone();
+            });
+            _cacheApi.RetrieveTestList(TestMode.PlayMode, (root) => {
+                _cachedPlayModeRoot = root;
+                CleanupCacheApiIfDone();
+            });
+        }
+
+        static void CleanupCacheApiIfDone() {
+            _cacheCallbacksRemaining--;
+            if (_cacheCallbacksRemaining <= 0 && _cacheApi != null) {
+                ScriptableObject.DestroyImmediate(_cacheApi);
+                _cacheApi = null;
+            }
+        }
+
+        static bool IsTestFrameworkStabilizing() {
+            return EditorApplication.timeSinceStartup - _lastDomainReloadTime < DomainReloadStabilizationSeconds;
+        }
+
+        // Entering Play Mode triggers a domain reload, which wipes every static in this class -
+        // including _lastRunState. A PlayMode run would therefore always report "no_run" by the
+        // time its results were asked for. Mirror the state into SessionState, which survives
+        // domain reloads and is cleared when the editor quits.
+        const string RunStateSessionKey = "UnityMcp.Tools_Test.runState";
+
+        /// <summary>
+        /// Writes _lastRunState to SessionState. Caller must hold _stateLock.
+        /// </summary>
+        static void PersistRunState() {
+            try {
+                SessionState.SetString(RunStateSessionKey,
+                    _lastRunState == null ? "" : JsonConvert.SerializeObject(_lastRunState));
+            } catch (Exception e) {
+                Debug.LogWarning($"[McpBridge] Could not persist test run state: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Makes the state a live callback is mutating the canonical one, then mirrors it.
+        /// A reload replaces _lastRunState with a deserialized copy, so a callback that
+        /// survived would otherwise be appending to an object nobody reads.
+        /// Caller must hold _stateLock.
+        /// </summary>
+        static void SyncAndPersist(TestRunState state) {
+            if (state == null) return;
+            // Never let a stale run clobber a newer one.
+            if (_lastRunState != null && _lastRunState.runId != state.runId) return;
+            _lastRunState = state;
+            PersistRunState();
+        }
+
+        /// <summary>
+        /// Re-registers ICallbacks for a run that is still in flight across a domain reload.
+        /// TestRunnerApi callbacks live in the managed domain, so entering (and leaving) Play
+        /// Mode destroys them along with everything else: without this, a PlayMode run starts,
+        /// the domain reloads, and no TestFinished/RunFinished ever reaches us again.
+        /// </summary>
+        static void ReattachInflightRunCallbacks() {
+            TestRunState inflight;
+            lock (_stateLock) {
+                inflight = _lastRunState != null && _lastRunState.isRunning ? _lastRunState : null;
+            }
+            if (inflight == null) return;
+
+            // Defer: the test framework is not ready to accept registrations this early
+            // in the reload.
+            EditorApplication.delayCall += () => {
+                try {
+                    var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+                    api.RegisterCallbacks(new TestCallbacks(inflight, api, inflight.runMode));
+                } catch (Exception e) {
+                    Debug.LogWarning($"[McpBridge] Could not re-attach test callbacks: {e.Message}");
+                }
+            };
+        }
+
+        /// <summary>
+        /// Restores _lastRunState from SessionState after a domain reload.
+        /// </summary>
+        static void RestoreRunState() {
+            var json = SessionState.GetString(RunStateSessionKey, "");
+            if (string.IsNullOrEmpty(json)) return;
+            try {
+                var restored = JsonConvert.DeserializeObject<TestRunState>(json);
+                if (restored == null || restored.results == null) return;
+                lock (_stateLock) {
+                    _lastRunState = restored;
+                }
+            } catch (Exception e) {
+                Debug.LogWarning($"[McpBridge] Could not restore test run state: {e.Message}");
+            }
+        }
+
+        // Tool Handlers
+
+        /// <summary>
+        /// Lists all available tests in the project.
+        /// </summary>
+        public static ToolResult ListTests(JObject args) {
+            if (EditorApplication.isCompiling) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "compiling",
+                    message = "Cannot list tests while compiling. Please wait and retry.",
+                    count = 0,
+                    tests = Array.Empty<object>()
+                }, Formatting.Indented), true);
+            }
+
+            if (IsTestFrameworkStabilizing()) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "stabilizing",
+                    message = "Test framework is stabilizing after domain reload. Please wait ~1 second and retry.",
+                    count = 0,
+                    tests = Array.Empty<object>()
+                }, Formatting.Indented), true);
+            }
+
+            var testModeStr = args.Value<string>("testMode")?.ToLowerInvariant() ?? "all";
+            var nameFilter = args.Value<string>("nameFilter");
+
+            try {
+                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+                var results = new List<object>();
+                bool receivedCallback = false;
+
+                if (testModeStr == "all" || testModeStr == "editmode") {
+                    var editModeTests = GetTestList(api, TestMode.EditMode, nameFilter, out bool editCallback);
+                    receivedCallback |= editCallback;
+                    results.AddRange(editModeTests);
+                }
+
+                if (testModeStr == "all" || testModeStr == "playmode") {
+                    var playModeTests = GetTestList(api, TestMode.PlayMode, nameFilter, out bool playCallback);
+                    receivedCallback |= playCallback;
+                    results.AddRange(playModeTests);
+                }
+
+                ScriptableObject.DestroyImmediate(api);
+
+                // If callback wasn't invoked, the test framework may not be ready
+                // Note: Unity 6000.x may have issues with RetrieveTestList, test running still works
+                if (!receivedCallback) {
+                    return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                        status = "not_ready",
+                        message = "Test framework did not respond. This can happen right after domain reload.",
+                        hint = "You can still run tests using unity.test.run without a filter - the test count will be available in the results.",
+                        count = 0,
+                        tests = Array.Empty<object>()
+                    }, Formatting.Indented), true);
+                }
+
+                var response = new {
+                    status = "ok",
+                    count = results.Count,
+                    tests = results
+                };
+
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(response, Formatting.Indented));
+            } catch (Exception e) {
+                return ToolResultUtil.Text($"Failed to list tests: {e.Message}", true);
+            }
+        }
+
+        /// <summary>
+        /// Runs tests and waits for completion before returning results.
+        /// </summary>
+        public static ToolResult RunTests(JObject args) {
+            var testModeStr = args.Value<string>("testMode")?.ToLowerInvariant() ?? "editmode";
+            var testFilter = args.Value<string>("testFilter");
+            var categoryFilter = args.Value<string>("categoryFilter");
+            var assemblyFilter = args.Value<string>("assemblyFilter");
+            var resultsPath = args.Value<string>("resultsPath");
+
+            if (EditorApplication.isCompiling) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "compiling",
+                    message = "Cannot run tests while compiling. Please wait and retry."
+                }, Formatting.Indented), true);
+            }
+
+            if (IsTestFrameworkStabilizing()) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "stabilizing",
+                    message = "Test framework is stabilizing after domain reload. Please wait ~1 second and retry."
+                }, Formatting.Indented), true);
+            }
+
+            try {
+                var parsedMode = ParseRunMode(testModeStr);
+                if (parsedMode == null) {
+                    return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                        status = "invalid_mode",
+                        message = testModeStr == "all"
+                            ? "testMode 'all' is not supported: the Test Framework runs a combined run as EditMode only and reports it complete."
+                            : $"Invalid testMode: {testModeStr}.",
+                        hint = "Use 'editmode' or 'playmode'. To cover both, start one run of each."
+                    }, Formatting.Indented), true);
+                }
+                var testMode = parsedMode.Value;
+
+                // Create state for this run
+                var state = new TestRunState {
+                    runId = Guid.NewGuid().ToString(),
+                    isRunning = true,
+                    startTime = DateTime.UtcNow,
+                    results = new List<TestResultInfo>(),
+                    runMode = testMode,
+                    resultsPath = string.IsNullOrEmpty(resultsPath) ? null : System.IO.Path.GetFullPath(resultsPath)
+                };
+
+                lock (_stateLock) {
+                    _lastRunState = state;
+                    PersistRunState();
+                }
+
+                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+
+                // Build filter
+                var filter = new Filter {
+                    testMode = testMode
+                };
+
+                // If testFilter is provided, resolve partial names to full test names
+                if (!string.IsNullOrEmpty(testFilter)) {
+                    var resolvedNames = ResolveTestNames(api, testMode, testFilter, out bool callbackInvoked);
+
+                    // If callback wasn't invoked, the test framework isn't ready yet
+                    if (!callbackInvoked) {
+                        ScriptableObject.DestroyImmediate(api);
+                        return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                            status = "not_ready",
+                            message = "Test framework did not respond when resolving test filter. This can happen right after domain reload.",
+                            hint = "Wait ~1 second and retry, or run tests without a filter."
+                        }, Formatting.Indented), true);
+                    }
+
+                    if (resolvedNames.Length == 0) {
+                        ScriptableObject.DestroyImmediate(api);
+                        return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                            status = "no_match",
+                            message = $"No tests found matching filter: {testFilter}",
+                            hint = "Use unity.test.list to see available tests. Filter matches against test name or full name (case-insensitive substring)."
+                        }, Formatting.Indented), true);
+                    }
+                    filter.testNames = resolvedNames;
+                    Debug.Log($"[McpBridge] Test filter '{testFilter}' resolved to {resolvedNames.Length} tests: {string.Join(", ", resolvedNames.Take(5))}{(resolvedNames.Length > 5 ? "..." : "")}");
+                }
+
+                if (!string.IsNullOrEmpty(categoryFilter)) {
+                    filter.categoryNames = categoryFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(s => s.Trim()).ToArray();
+                    var refusedCategories = RefuseUnknownCategories(api, testMode, filter.categoryNames);
+                    if (refusedCategories != null) return refusedCategories;
+                }
+
+                if (!string.IsNullOrEmpty(assemblyFilter)) {
+                    filter.assemblyNames = SplitAssemblyFilter(assemblyFilter);
+                    var refused = RefuseUnknownAssemblies(api, testMode, filter.assemblyNames);
+                    if (refused != null) return refused;
+                }
+
+                // Register callbacks
+                var callbacks = new TestCallbacks(state, api, testMode);
+                api.RegisterCallbacks(callbacks);
+
+                // Execute tests
+                api.Execute(new ExecutionSettings(filter));
+
+                // Return immediately with run ID: user should poll for results
+                var testsToRun = filter.testNames?.Length ?? 0;
+                var response = new {
+                    message = "Test run started.",
+                    runId = state.runId,
+                    testMode = testModeStr,
+                    testsToRun = testsToRun,
+                    resultsPath = state.resultsPath,
+                    note = testsToRun == 0
+                        ? $"Running every {testModeStr} test the filters select (exact count available in getResults after the run starts)."
+                        : null,
+                    hint = "Use unity.test.getResults with this runId to check status and get results."
+                };
+
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(response, Formatting.Indented));
+            } catch (Exception e) {
+                return ToolResultUtil.Text($"Failed to run tests: {e.Message}", true);
+            }
+        }
+
+        /// <summary>
+        /// Gets results from the last test run.
+        /// </summary>
+        public static ToolResult GetResults(JObject args) {
+            var runId = args.Value<string>("runId");
+
+            lock (_stateLock) {
+                if (_lastRunState == null) {
+                    return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                        status = "no_run",
+                        message = "No test run has been started yet."
+                    }, Formatting.Indented));
+                }
+
+                // If runId provided, verify it matches
+                if (!string.IsNullOrEmpty(runId) && _lastRunState.runId != runId) {
+                    return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                        status = "not_found",
+                        message = $"Run ID '{runId}' not found. Current run ID: {_lastRunState.runId}"
+                    }, Formatting.Indented));
+                }
+
+                var status = RunStatus(_lastRunState.isRunning, _lastRunState.results.Count);
+                var response = new {
+                    runId = _lastRunState.runId,
+                    status,
+                    message = status == "completed_empty"
+                        ? "The run finished without running a single test, so it proves nothing. Check the filters with unity_test_list."
+                        : null,
+                    startTime = _lastRunState.startTime.ToString("o"),
+                    endTime = _lastRunState.endTime?.ToString("o"),
+                    durationMs = _lastRunState.endTime.HasValue
+                        ? (long)(_lastRunState.endTime.Value - _lastRunState.startTime).TotalMilliseconds
+                        : (long?)(DateTime.UtcNow - _lastRunState.startTime).TotalMilliseconds,
+                    summary = new {
+                        total = _lastRunState.totalTestCount > 0 ? _lastRunState.totalTestCount : _lastRunState.results.Count,
+                        completed = _lastRunState.results.Count,
+                        passed = _lastRunState.results.Count(r => r.status == "Passed"),
+                        failed = _lastRunState.results.Count(r => r.status == "Failed"),
+                        skipped = _lastRunState.results.Count(r => r.status == "Skipped"),
+                        inconclusive = _lastRunState.results.Count(r => r.status == "Inconclusive")
+                    },
+                    results = _lastRunState.results.Select(r => new {
+                        name = r.name,
+                        fullName = r.fullName,
+                        status = r.status,
+                        durationMs = r.durationMs,
+                        message = r.message,
+                        stackTrace = r.stackTrace,
+                        testMode = r.testMode
+                    }).ToList()
+                };
+
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(response, Formatting.Indented), status == "completed_empty");
+            }
+        }
+
+        /// <summary>
+        /// Runs EditMode tests. This starts the test run and returns immediately.
+        /// NOTE: Despite the name, this does NOT block. Unity's test callbacks require the editor
+        /// update loop to run, making true synchronous execution impossible.
+        /// Use unity.test.getResults to poll for completion.
+        /// </summary>
+        public static ToolResult RunTestsSync(JObject args) {
+            var testModeStr = args.Value<string>("testMode")?.ToLowerInvariant() ?? "editmode";
+            var testFilter = args.Value<string>("testFilter");
+            var categoryFilter = args.Value<string>("categoryFilter");
+            var assemblyFilter = args.Value<string>("assemblyFilter");
+            var resultsPath = args.Value<string>("resultsPath");
+
+            if (EditorApplication.isCompiling) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "compiling",
+                    message = "Cannot run tests while compiling. Please wait and retry."
+                }, Formatting.Indented), true);
+            }
+
+            if (IsTestFrameworkStabilizing()) {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "stabilizing",
+                    message = "Test framework is stabilizing after domain reload. Please wait ~1 second and retry."
+                }, Formatting.Indented), true);
+            }
+
+            // PlayMode tests cannot be run synchronously
+            if (testModeStr == "playmode" || testModeStr == "all") {
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "invalid_mode",
+                    message = "PlayMode tests cannot be run with runSync as they require entering Play Mode. " +
+                              "Use unity.test.run instead and poll unity.test.getResults for completion."
+                }, Formatting.Indented), true);
+            }
+
+            try {
+                TestMode testMode = TestMode.EditMode;
+
+                // Create state for this run
+                var state = new TestRunState {
+                    runId = Guid.NewGuid().ToString(),
+                    isRunning = true,
+                    startTime = DateTime.UtcNow,
+                    results = new List<TestResultInfo>(),
+                    runMode = testMode,
+                    resultsPath = string.IsNullOrEmpty(resultsPath) ? null : System.IO.Path.GetFullPath(resultsPath)
+                };
+
+                lock (_stateLock) {
+                    _lastRunState = state;
+                    PersistRunState();
+                }
+
+                var api = ScriptableObject.CreateInstance<TestRunnerApi>();
+
+                // Build filter
+                var filter = new Filter {
+                    testMode = testMode
+                };
+
+                // If testFilter is provided, resolve partial names to full test names
+                if (!string.IsNullOrEmpty(testFilter)) {
+                    var resolvedNames = ResolveTestNames(api, testMode, testFilter, out bool callbackInvoked);
+
+                    // If callback wasn't invoked, the test framework isn't ready yet
+                    if (!callbackInvoked) {
+                        ScriptableObject.DestroyImmediate(api);
+                        return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                            status = "not_ready",
+                            message = "Test framework did not respond when resolving test filter. This can happen right after domain reload.",
+                            hint = "Wait ~1 second and retry, or run tests without a filter."
+                        }, Formatting.Indented), true);
+                    }
+
+                    if (resolvedNames.Length == 0) {
+                        ScriptableObject.DestroyImmediate(api);
+                        return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                            status = "no_match",
+                            message = $"No tests found matching filter: {testFilter}",
+                            hint = "Use unity.test.list to see available tests. Filter matches against test name or full name (case-insensitive substring)."
+                        }, Formatting.Indented), true);
+                    }
+                    filter.testNames = resolvedNames;
+                    Debug.Log($"[McpBridge] Test filter '{testFilter}' resolved to {resolvedNames.Length} tests: {string.Join(", ", resolvedNames.Take(5))}{(resolvedNames.Length > 5 ? "..." : "")}");
+                }
+
+                if (!string.IsNullOrEmpty(categoryFilter)) {
+                    filter.categoryNames = categoryFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(s => s.Trim()).ToArray();
+                    var refusedCategories = RefuseUnknownCategories(api, testMode, filter.categoryNames);
+                    if (refusedCategories != null) return refusedCategories;
+                }
+
+                if (!string.IsNullOrEmpty(assemblyFilter)) {
+                    filter.assemblyNames = SplitAssemblyFilter(assemblyFilter);
+                    var refused = RefuseUnknownAssemblies(api, testMode, filter.assemblyNames);
+                    if (refused != null) return refused;
+                }
+
+                // Register callbacks
+                var callbacks = new TestCallbacks(state, api, testMode);
+                api.RegisterCallbacks(callbacks);
+
+                // Execute tests
+                api.Execute(new ExecutionSettings(filter));
+
+                // IMPORTANT: Unity's test runner callbacks run on the main thread via EditorApplication.update.
+                // We CANNOT block the main thread waiting for results: that would prevent callbacks from running.
+                // Instead, we return immediately and let the user poll for results.
+                //
+                // The "sync" behavior is achieved by the MCP server waiting and polling unity.test.getResults
+                // until completion, NOT by blocking here.
+                
+                var testsToRun = filter.testNames?.Length ?? 0;
+                var response = new {
+                    status = "started",
+                    message = "Test run started. Results will be available via unity.test.getResults.",
+                    runId = state.runId,
+                    testMode = testModeStr,
+                    testsToRun = testsToRun,
+                    resultsPath = state.resultsPath,
+                    note = testsToRun == 0
+                        ? "Running every EditMode test the filters select (exact count available in getResults after the run starts). Poll getResults to check completion."
+                        : "EditMode tests typically complete within a few seconds. Poll getResults to check completion."
+                };
+
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(response, Formatting.Indented));
+            } catch (Exception e) {
+                return ToolResultUtil.Text($"Failed to run tests: {e.Message}", true);
+            }
+        }
+
+        // Helper Methods
+
+        /// <summary>
+        /// The one mode a run executes, or null for anything else, "all" included.
+        /// The Test Framework runs a filter carrying EditMode | PlayMode as EditMode
+        /// only and reports it complete: 296 cases, status completed, not one
+        /// PlayMode entry. Two runs are the honest way to cover both.
+        /// </summary>
+        public static TestMode? ParseRunMode(string testModeStr) {
+            if (testModeStr == "playmode") return TestMode.PlayMode;
+            if (testModeStr == "editmode") return TestMode.EditMode;
+            return null;
+        }
+
+        /// <summary>
+        /// What GetResults reports. A run that finished having recorded no result
+        /// tested nothing, whichever filter or combination of filters caused it,
+        /// so it never reads as "completed".
+        /// </summary>
+        public static string RunStatus(bool isRunning, int resultCount) {
+            if (isRunning) return "running";
+            return resultCount == 0 ? "completed_empty" : "completed";
+        }
+
+        /// <summary>
+        /// The requested categories no test carries, compared exactly, as the
+        /// runner compares them.
+        /// </summary>
+        public static string[] UnknownCategoryNames(IEnumerable<string> known, IEnumerable<string> requested) {
+            var set = new HashSet<string>(known);
+            return requested.Where(n => !set.Contains(n)).Distinct().ToArray();
+        }
+
+        /// <summary>
+        /// Refuses a run whose category filter names a category no test in the
+        /// requested mode carries, or returns null to let it go ahead. The runner
+        /// says nothing about a category that matched nothing and reports the
+        /// empty run as a pass.
+        /// </summary>
+        static ToolResult RefuseUnknownCategories(TestRunnerApi api, TestMode testMode, string[] requested) {
+            var root = RetrieveTestRoot(api, testMode);
+            if (root == null) {
+                ScriptableObject.DestroyImmediate(api);
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "not_ready",
+                    message = "Test framework did not respond when checking the category filter. This can happen right after domain reload.",
+                    hint = "Wait ~1 second and retry."
+                }, Formatting.Indented), true);
+            }
+
+            var known = new HashSet<string>();
+            CollectCategories(root, known);
+            var unknown = UnknownCategoryNames(known, requested);
+            if (unknown.Length == 0) return null;
+
+            ScriptableObject.DestroyImmediate(api);
+            return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                status = "no_match",
+                message = $"No {testMode} test carries category {string.Join(", ", unknown)}, so the run would pass without running anything.",
+                available = known.OrderBy(n => n).ToArray(),
+                hint = "Name each category exactly, as listed in 'available'."
+            }, Formatting.Indented), true);
+        }
+
+        static void CollectCategories(ITestAdaptor node, HashSet<string> names) {
+            if (node.Categories != null) {
+                foreach (var category in node.Categories) names.Add(category);
+            }
+            if (!node.HasChildren) return;
+            foreach (var child in node.Children) CollectCategories(child, names);
+        }
+
+        /// <summary>
+        /// The assembly filter as the runner takes it: one name per entry,
+        /// without the ".dll" a test tree shows.
+        /// </summary>
+        static string[] SplitAssemblyFilter(string assemblyFilter) {
+            return assemblyFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .Select(s => s.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? s.Substring(0, s.Length - 4) : s)
+                .Where(s => s.Length > 0)
+                .ToArray();
+        }
+
+        /// <summary>
+        /// Refuses a run whose assembly filter names an assembly with no tests
+        /// in the requested mode, or returns null to let it go ahead.
+        ///
+        /// The runner matches assemblyNames exactly and says nothing about a
+        /// name that matched nothing: a run naming "OneJS.Tests,OneJSContainer.Tests"
+        /// ran only the first assembly and reported a clean pass, and a run of
+        /// the second name alone reported Passed with 0 cases. The real name was
+        /// OneJSContainer.Tests.PlayMode. A filter the caller wrote has to reach
+        /// something, the same rule testFilter's no_match already applies.
+        /// </summary>
+        static ToolResult RefuseUnknownAssemblies(TestRunnerApi api, TestMode testMode, string[] requested) {
+            var known = new HashSet<string>();
+            bool received = false;
+            foreach (var mode in new[] { TestMode.EditMode, TestMode.PlayMode }) {
+                if ((testMode & mode) == 0) continue;
+                var root = RetrieveTestRoot(api, mode);
+                if (root == null) continue;
+                received = true;
+                CollectTestAssemblies(root, known);
+            }
+
+            if (!received) {
+                ScriptableObject.DestroyImmediate(api);
+                return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                    status = "not_ready",
+                    message = "Test framework did not respond when checking the assembly filter. This can happen right after domain reload.",
+                    hint = "Wait ~1 second and retry."
+                }, Formatting.Indented), true);
+            }
+
+            var unknown = UnknownAssemblyNames(known, requested);
+            if (unknown.Length == 0) return null;
+
+            ScriptableObject.DestroyImmediate(api);
+            return ToolResultUtil.Text(JsonConvert.SerializeObject(new {
+                status = "no_match",
+                message = $"No {testMode} tests in assembly {string.Join(", ", unknown)}, so the run would pass without running it.",
+                available = known.OrderBy(n => n).ToArray(),
+                hint = "Name each test assembly exactly, as listed in 'available'."
+            }, Formatting.Indented), true);
+        }
+
+        /// <summary>
+        /// The requested names no known test assembly answers to, compared
+        /// exactly, as the runner compares them.
+        /// </summary>
+        public static string[] UnknownAssemblyNames(IEnumerable<string> known, IEnumerable<string> requested) {
+            var set = new HashSet<string>(known);
+            return requested.Where(n => !set.Contains(n)).Distinct().ToArray();
+        }
+
+        static void CollectTestAssemblies(ITestAdaptor node, HashSet<string> names) {
+            if (node.IsTestAssembly) {
+                names.Add(System.IO.Path.GetFileNameWithoutExtension(node.Name));
+                return;
+            }
+            if (!node.HasChildren) return;
+            foreach (var child in node.Children) CollectTestAssemblies(child, names);
+        }
+
+        /// <summary>
+        /// The test tree for one mode, or null when the framework has not
+        /// answered and nothing is cached.
+        /// </summary>
+        static ITestAdaptor RetrieveTestRoot(TestRunnerApi api, TestMode mode) {
+            ITestAdaptor found = null;
+            api.RetrieveTestList(mode, (rootTest) => {
+                if (rootTest == null) return;
+                found = rootTest;
+                if (mode == TestMode.EditMode) _cachedEditModeRoot = rootTest;
+                else _cachedPlayModeRoot = rootTest;
+            });
+            return found ?? (mode == TestMode.EditMode ? _cachedEditModeRoot : _cachedPlayModeRoot);
+        }
+
+        /// <summary>
+        /// Resolves partial test name filters to full test names.
+        /// Supports comma-separated partial names that match against test name or full name.
+        /// Returns null if the test framework didn't respond (not ready), empty array if no matches found.
+        /// </summary>
+        static string[] ResolveTestNames(TestRunnerApi api, TestMode testMode, string testFilter, out bool callbackInvoked) {
+            callbackInvoked = false;
+
+            var filterParts = testFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim().ToLowerInvariant())
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToArray();
+
+            if (filterParts.Length == 0) {
+                callbackInvoked = true; // No filter means we don't need to query
+                return Array.Empty<string>();
+            }
+
+            var matchedNames = new HashSet<string>();
+
+            // Collect tests from relevant modes
+            if ((testMode & TestMode.EditMode) != 0) {
+                CollectMatchingTests(api, TestMode.EditMode, filterParts, matchedNames, out bool editCallback);
+                callbackInvoked |= editCallback;
+            }
+            if ((testMode & TestMode.PlayMode) != 0) {
+                CollectMatchingTests(api, TestMode.PlayMode, filterParts, matchedNames, out bool playCallback);
+                callbackInvoked |= playCallback;
+            }
+
+            return matchedNames.ToArray();
+        }
+
+        static void CollectMatchingTests(TestRunnerApi api, TestMode mode, string[] filterParts, HashSet<string> matchedNames, out bool callbackInvoked) {
+            var adaptor = new TestNameCollector(filterParts, matchedNames);
+            bool[] received = { false };
+            api.RetrieveTestList(mode, (rootTest) => {
+                received[0] = true;
+                // Update cache on successful retrieval
+                if (rootTest != null) {
+                    if (mode == TestMode.EditMode) _cachedEditModeRoot = rootTest;
+                    else _cachedPlayModeRoot = rootTest;
+                }
+                adaptor.OnTestListReceived(rootTest);
+            });
+
+            if (!received[0]) {
+                // Callback didn't fire synchronously: fall back to cached test tree
+                var cached = mode == TestMode.EditMode ? _cachedEditModeRoot : _cachedPlayModeRoot;
+                if (cached != null) {
+                    received[0] = true;
+                    adaptor.OnTestListReceived(cached);
+                }
+            }
+
+            callbackInvoked = received[0];
+        }
+
+        static List<object> GetTestList(TestRunnerApi api, TestMode mode, string nameFilter, out bool receivedCallback) {
+            var results = new List<object>();
+            var adaptor = new TestListAdaptor(results, mode.ToString(), nameFilter);
+            bool[] callbackReceived = { false };  // Use array to allow capture in lambda
+            api.RetrieveTestList(mode, (rootTest) => {
+                callbackReceived[0] = true;
+                // Update cache on successful retrieval
+                if (rootTest != null) {
+                    if (mode == TestMode.EditMode) _cachedEditModeRoot = rootTest;
+                    else _cachedPlayModeRoot = rootTest;
+                }
+                adaptor.OnTestListReceived(rootTest);
+            });
+
+            if (!callbackReceived[0]) {
+                // Callback didn't fire synchronously: fall back to cached test tree
+                var cached = mode == TestMode.EditMode ? _cachedEditModeRoot : _cachedPlayModeRoot;
+                if (cached != null) {
+                    callbackReceived[0] = true;
+                    adaptor.OnTestListReceived(cached);
+                }
+            }
+
+            receivedCallback = callbackReceived[0];
+            return results;
+        }
+
+        // Internal Types
+
+        class TestRunState {
+            public string runId;
+            public bool isRunning;
+            public DateTime startTime;
+            public DateTime? endTime;
+            public List<TestResultInfo> results;
+            public int totalTestCount; // Populated when run starts
+            public TestMode runMode;   // Needed to re-attach callbacks after a domain reload
+            public string resultsPath; // NUnit XML written on RunFinished, when requested
+        }
+
+        class TestResultInfo {
+            public string name;
+            public string fullName;
+            public string status;
+            public double durationMs;
+            public string message;
+            public string stackTrace;
+            public string testMode;
+        }
+
+        /// <summary>
+        /// Collects full test names that match any of the filter parts.
+        /// </summary>
+        class TestNameCollector {
+            readonly string[] _filterParts;
+            readonly HashSet<string> _matchedNames;
+
+            public TestNameCollector(string[] filterParts, HashSet<string> matchedNames) {
+                _filterParts = filterParts;
+                _matchedNames = matchedNames;
+            }
+
+            public void OnTestListReceived(ITestAdaptor rootTest) {
+                if (rootTest == null) return;
+                CollectMatchingTests(rootTest);
+            }
+
+            void CollectMatchingTests(ITestAdaptor test) {
+                if (test == null) return;
+
+                // Only check leaf tests (actual test methods, not fixtures)
+                if (!test.HasChildren && test.IsSuite == false) {
+                    var nameLower = test.Name?.ToLowerInvariant() ?? "";
+                    var fullNameLower = test.FullName?.ToLowerInvariant() ?? "";
+
+                    foreach (var filter in _filterParts) {
+                        if (nameLower.Contains(filter) || fullNameLower.Contains(filter)) {
+                            _matchedNames.Add(test.FullName);
+                            break;
+                        }
+                    }
+                }
+
+                // Recurse into children
+                if (test.Children != null) {
+                    foreach (var child in test.Children) {
+                        CollectMatchingTests(child);
+                    }
+                }
+            }
+        }
+
+        class TestListAdaptor {
+            readonly List<object> _results;
+            readonly string _testMode;
+            readonly string _nameFilter;
+
+            public TestListAdaptor(List<object> results, string testMode, string nameFilter) {
+                _results = results;
+                _testMode = testMode;
+                _nameFilter = nameFilter?.ToLowerInvariant();
+            }
+
+            public void OnTestListReceived(ITestAdaptor rootTest) {
+                if (rootTest == null) return;
+                CollectTests(rootTest);
+            }
+
+            void CollectTests(ITestAdaptor test) {
+                if (test == null) return;
+
+                // Only add leaf tests (actual test methods, not fixtures)
+                if (!test.HasChildren && test.IsSuite == false) {
+                    if (string.IsNullOrEmpty(_nameFilter) ||
+                        test.Name.ToLowerInvariant().Contains(_nameFilter) ||
+                        test.FullName.ToLowerInvariant().Contains(_nameFilter)) {
+                        _results.Add(new {
+                            name = test.Name,
+                            fullName = test.FullName,
+                            testMode = _testMode,
+                            categories = test.Categories?.ToArray() ?? Array.Empty<string>()
+                        });
+                    }
+                }
+
+                // Recurse into children
+                if (test.Children != null) {
+                    foreach (var child in test.Children) {
+                        CollectTests(child);
+                    }
+                }
+            }
+        }
+
+        class TestCallbacks : ICallbacks {
+            readonly TestRunState _state;
+            readonly TestRunnerApi _api;
+            readonly TestMode _runMode;
+
+            public TestCallbacks(TestRunState state, TestRunnerApi api, TestMode runMode) {
+                _state = state;
+                _api = api;
+                _runMode = runMode;
+            }
+
+            /// <summary>
+            /// Determines whether a finished test was an EditMode or PlayMode test.
+            /// ITestAdaptor.TestMode is only populated from the NUnit "platform" property
+            /// and propagated via SetParent; adaptors arriving through the result callbacks
+            /// often report default(TestMode) == 0, so the requested run mode is the reliable
+            /// source. Never infer from TestCaseCount: that is the number of cases under the
+            /// node (>= 1 for every real test), which labelled every result "PlayMode".
+            /// </summary>
+            static string ResolveTestMode(ITestAdaptor test, TestMode runMode) {
+                for (var node = test; node != null; node = node.Parent) {
+                    if (node.TestMode == TestMode.EditMode) return "EditMode";
+                    if (node.TestMode == TestMode.PlayMode) return "PlayMode";
+                }
+                // Unambiguous for a single-mode run; only a combined run can be undecidable.
+                if (runMode == TestMode.EditMode) return "EditMode";
+                if (runMode == TestMode.PlayMode) return "PlayMode";
+                return "Unknown";
+            }
+
+            public void RunStarted(ITestAdaptor testsToRun) {
+                var count = CountLeafTests(testsToRun);
+                lock (_stateLock) {
+                    _state.totalTestCount = count;
+                    SyncAndPersist(_state);
+                }
+                Debug.Log($"[McpBridge] Test run started: {_state.runId}, {count} tests to run");
+            }
+
+            static int CountLeafTests(ITestAdaptor test) {
+                if (test == null) return 0;
+                if (!test.HasChildren && !test.IsSuite) return 1;
+
+                int count = 0;
+                if (test.Children != null) {
+                    foreach (var child in test.Children) {
+                        count += CountLeafTests(child);
+                    }
+                }
+                return count;
+            }
+
+            public void RunFinished(ITestResultAdaptor result) {
+                lock (_stateLock) {
+                    _state.isRunning = false;
+                    _state.endTime = DateTime.UtcNow;
+                    SyncAndPersist(_state);
+                }
+
+                Debug.Log($"[McpBridge] Test run finished: {_state.runId}");
+
+                /*
+                 * The Test Framework's own NUnit XML, the same file the `unity test`
+                 * CLI writes with --output. The JSON results carry no categories,
+                 * and the release graphics gate reads categories, so a PlayMode run
+                 * that the CLI cannot drive still needs this file.
+                 */
+                if (!string.IsNullOrEmpty(_state.resultsPath)) {
+                    try {
+                        var dir = System.IO.Path.GetDirectoryName(_state.resultsPath);
+                        if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
+                        // TestRunnerApi.SaveResultToFile is Unity 6+ only; on Unity 2022 use ITestResultAdaptor.ToXml().
+                        System.IO.File.WriteAllText(_state.resultsPath, result.ToXml().OuterXml);
+                        Debug.Log($"[McpBridge] Test results written to {_state.resultsPath}");
+                    } catch (Exception e) {
+                        Debug.LogWarning($"[McpBridge] Could not write test results to {_state.resultsPath}: {e.Message}");
+                    }
+                }
+
+                // Unregister and cleanup
+                try {
+                    _api.UnregisterCallbacks(this);
+                } catch {
+                    // Ignore unregister errors
+                }
+            }
+
+            public void TestStarted(ITestAdaptor test) {
+                // Can be used for progress tracking if needed
+            }
+
+            public void TestFinished(ITestResultAdaptor result) {
+                if (result == null) return;
+
+                // Only record leaf test results (not fixtures)
+                if (result.Test == null || result.Test.IsSuite) return;
+
+                var info = new TestResultInfo {
+                    name = result.Test.Name,
+                    fullName = result.Test.FullName,
+                    status = result.TestStatus.ToString(),
+                    durationMs = result.Duration * 1000,
+                    message = result.Message,
+                    stackTrace = result.StackTrace,
+                    testMode = ResolveTestMode(result.Test, _runMode)
+                };
+
+                lock (_stateLock) {
+                    _state.results.Add(info);
+                    SyncAndPersist(_state);
+                }
+            }
+        }
+    }
+}

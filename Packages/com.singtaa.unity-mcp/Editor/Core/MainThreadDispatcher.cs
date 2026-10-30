@@ -1,0 +1,131 @@
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+using UnityEditor;
+using UnityEngine;
+
+namespace UnityMcp {
+    /// <summary>
+    /// Dispatches actions from background threads to Unity's main thread.
+    ///
+    /// MCP tool calls arrive on the TCP background thread but most Unity APIs
+    /// (GameObject manipulation, scene operations, etc.) must run on the main thread.
+    /// This dispatcher queues actions and executes them during EditorApplication.update.
+    ///
+    /// CRITICAL: This dispatcher only works in the main Unity Editor process.
+    /// AssetImportWorker and other batch mode processes do NOT have a functioning
+    /// EditorApplication.update loop, so actions queued in those processes will
+    /// NEVER execute, causing tool calls to timeout.
+    /// </summary>
+    public static class MainThreadDispatcher {
+        static readonly ConcurrentQueue<Action> _queue = new ConcurrentQueue<Action>();
+
+        static bool _installed;
+        static long _lastTickUtcTicks;
+        static int _mainThreadId;
+        static int _queued;
+        static int _executed;
+
+        public static bool IsInstalled => _installed;
+        public static int MainThreadId => _mainThreadId;
+        public static int QueuedCount => Interlocked.CompareExchange(ref _queued, 0, 0);
+        public static int ExecutedCount => Interlocked.CompareExchange(ref _executed, 0, 0);
+
+        public static void Install() {
+            // Always re-register event handlers after domain reload
+            // Domain reloads clear event handlers but preserve static fields
+            _installed = true;
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            // Not ticked yet in this domain. Stamping the time here made the
+            // ping a plain "pong" for the first second after a reload, while
+            // Unity was still entering play mode and no tool could run.
+            Interlocked.Exchange(ref _lastTickUtcTicks, 0);
+
+            EditorApplication.update -= Tick;
+            EditorApplication.update += Tick;
+
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeReload;
+        }
+
+        static void OnBeforeReload() {
+            Shutdown();
+        }
+
+        public static void Shutdown() {
+            if (!_installed) return;
+            _installed = false;
+
+            EditorApplication.update -= Tick;
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeReload;
+
+            while (_queue.TryDequeue(out _)) { }
+            Interlocked.Exchange(ref _queued, 0);
+        }
+
+        public static void Enqueue(Action action) {
+            if (action == null) return;
+            if (!_installed) {
+                Debug.LogWarning("[UnityMcp] MainThreadDispatcher not installed, action dropped.");
+                return;
+            }
+            _queue.Enqueue(action);
+            Interlocked.Increment(ref _queued);
+        }
+
+        static void Tick() {
+            Interlocked.Exchange(ref _lastTickUtcTicks, DateTime.UtcNow.Ticks);
+
+            var count = 0;
+            while (count < 512 && _queue.TryDequeue(out var a)) {
+                try {
+                    a();
+                } catch (Exception e) {
+                    Debug.LogException(e);
+                }
+                Interlocked.Decrement(ref _queued);
+                Interlocked.Increment(ref _executed);
+                count++;
+            }
+        }
+
+        /// <summary>How long a main thread that has not ticked counts as stalled rather than between frames.</summary>
+        public const long StalledAfterMs = 1000;
+
+        /// <summary>Milliseconds since the last tick, or -1 before the first.</summary>
+        static long TickAgeMs() {
+            var lastTicks = Interlocked.Read(ref _lastTickUtcTicks);
+            if (lastTicks <= 0) return -1;
+            var last = new DateTime(lastTicks, DateTimeKind.Utc);
+            return (long)Math.Max(0, (DateTime.UtcNow - last).TotalMilliseconds);
+        }
+
+        /// <summary>
+        /// The reply to unity.bridge.ping, which the TCP thread answers. A bare
+        /// "pong" only says the socket is up: after a domain reload it arrives
+        /// seconds before the main thread runs anything, and an unfocused editor
+        /// can starve the main thread indefinitely. So past StalledAfterMs the
+        /// reply says how long the main thread has been gone and how many calls
+        /// wait on it. It still starts with "pong".
+        /// </summary>
+        public static string PingReply() => PingReply(TickAgeMs(), QueuedCount);
+
+        public static string PingReply(long tickAgeMs, int queued) {
+            if (tickAgeMs < 0) return $"pong, but the main thread has not run yet ({queued} calls waiting); tools wait for it";
+            if (tickAgeMs < StalledAfterMs) return "pong";
+            return $"pong, but the main thread has not run for {tickAgeMs} ms ({queued} calls waiting); tools wait for it";
+        }
+
+        public static string GetStatusJson() {
+            var ageMs = TickAgeMs();
+
+            return "{"
+                   + "\"installed\":" + (_installed ? "true" : "false") + ","
+                   + "\"mainThreadId\":" + _mainThreadId + ","
+                   + "\"lastTickAgeMs\":" + ageMs + ","
+                   + "\"queued\":" + Interlocked.CompareExchange(ref _queued, 0, 0) + ","
+                   + "\"executed\":" + Interlocked.CompareExchange(ref _executed, 0, 0)
+                   + "}";
+        }
+    }
+}

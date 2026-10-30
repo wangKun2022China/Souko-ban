@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: Server~ (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    # The Node server is the half of this package that can be tested without an
+    # editor. The Unity-side tests need a licensed editor and run in the OneJS
+    # submodule's workflow instead.
+    defaults:
+      run:
+        working-directory: Server~
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # No dependency cache on purpose. The tree here is a single package,
+          # so caching saves nothing, and setup-node's post-job save failed the
+          # whole Windows job trying to store a cache directory npm had not
+          # created. The tests themselves were passing underneath it.
+
+      - run: npm ci
+
+      # Plain JS, no typecheck script: node --test over test/*.test.js
+      - run: npm test
