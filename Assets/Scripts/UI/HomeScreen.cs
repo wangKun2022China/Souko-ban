@@ -118,7 +118,7 @@ namespace SokoBan.UI
 
             var btn = go.GetComponent<Button>();
             btn.interactable = !locked;
-            if (!locked) btn.onClick.AddListener(() => _controller.StartClassic(index));
+            if (!locked) btn.onClick.AddListener(() => _controller.StartLevel(lv.Id));
         }
 
         private void AddCustomNode(CustomLevel lv, int num)
@@ -136,7 +136,7 @@ namespace SokoBan.UI
             number.text = num.ToString();
             number.color = Color.white;
 
-            go.GetComponent<Button>().onClick.AddListener(() => _controller.StartCustom(lv.id));
+            go.GetComponent<Button>().onClick.AddListener(() => _controller.StartLevel(lv.id));
 
             AddCardActions(go, lv);
         }
